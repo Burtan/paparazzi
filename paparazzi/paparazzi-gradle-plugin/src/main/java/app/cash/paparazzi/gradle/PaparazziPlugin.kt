@@ -15,19 +15,20 @@
  */
 package app.cash.paparazzi.gradle
 
-import app.cash.paparazzi.gradle.utils.artifactViewFor
-import app.cash.paparazzi.gradle.utils.artifactsFor
+import com.android.build.gradle.AppExtension
 import com.android.build.gradle.BaseExtension
 import com.android.build.gradle.LibraryExtension
-import com.android.build.gradle.internal.publishing.AndroidArtifacts.ArtifactType
+import com.android.build.gradle.internal.cxx.logging.infoln
 import com.android.build.gradle.tasks.MergeSourceSetFolders
+import com.android.ide.common.symbols.getPackageNameFromManifest
 import org.gradle.api.Action
 import org.gradle.api.DefaultTask
 import org.gradle.api.Plugin
 import org.gradle.api.Project
 import org.gradle.api.Task
+import org.gradle.api.UnknownDomainObjectException
 import org.gradle.api.artifacts.type.ArtifactTypeDefinition
-import org.gradle.api.artifacts.type.ArtifactTypeDefinition.ARTIFACT_TYPE_ATTRIBUTE
+import org.gradle.api.attributes.Attribute
 import org.gradle.api.file.Directory
 import org.gradle.api.file.DirectoryProperty
 import org.gradle.api.file.FileCollection
@@ -52,18 +53,19 @@ import kotlin.io.path.invariantSeparatorsPathString
 class PaparazziPlugin : Plugin<Project> {
   override fun apply(project: Project) {
     project.afterEvaluate {
-      check(!project.plugins.hasPlugin("com.android.application")) {
-        error(
-          "Currently, Paparazzi only works in Android library -- not application -- modules. " +
+      if (project.plugins.hasPlugin("com.android.application")) {
+        infoln(
+          "Currently, Paparazzi only works in Android application with compose. " +
             "See https://github.com/cashapp/paparazzi/issues/107"
         )
-      }
-      check(project.plugins.hasPlugin("com.android.library")) {
-        "The Android Gradle library plugin must be applied for Paparazzi to work properly."
+        project.plugins.withId("com.android.application") { setupPaparazzi(project) }
+      } else {
+        check(project.plugins.hasPlugin("com.android.library")) {
+          "The Android Gradle library plugin must be applied for Paparazzi to work properly."
+        }
+        project.plugins.withId("com.android.library") { setupPaparazzi(project) }
       }
     }
-
-    project.plugins.withId("com.android.library") { setupPaparazzi(project) }
   }
 
   private fun setupPaparazzi(project: Project) {
@@ -74,8 +76,14 @@ class PaparazziPlugin : Plugin<Project> {
     val verifyVariants = project.tasks.register("verifyPaparazzi")
     val recordVariants = project.tasks.register("recordPaparazzi")
 
-    val variants = project.extensions.getByType(LibraryExtension::class.java)
-      .libraryVariants
+    val variants = try {
+      project.extensions.getByType(LibraryExtension::class.java)
+        .libraryVariants
+    } catch (e: UnknownDomainObjectException) {
+      project.extensions.getByType(AppExtension::class.java)
+        .applicationVariants
+    }
+
     variants.all { variant ->
       val variantSlug = variant.name.capitalize(Locale.US)
       val testVariant = variant.unitTestVariant ?: return@all
@@ -85,23 +93,16 @@ class PaparazziPlugin : Plugin<Project> {
         project.tasks.named("merge${variantSlug}Assets") as TaskProvider<MergeSourceSetFolders>
       val mergeAssetsOutputDir = mergeAssetsProvider.flatMap { it.outputDir }
       val buildDirectory = project.layout.buildDirectory
-      val gradleUserHomeDir = project.gradle.gradleUserHomeDir
       val reportOutputDir = buildDirectory.dir("reports/paparazzi")
       val snapshotOutputDir = project.layout.projectDirectory.dir("src/test/snapshots")
 
-      // local resources
-      val localResourceDirs = project
-        .files(variant.sourceSets.flatMap { it.resDirectories })
-
-      // library resources
-      // https://android.googlesource.com/platform/tools/base/+/96015063acd3455a76cdf1cc71b23b0828c0907f/build-system/gradle-core/src/main/java/com/android/build/gradle/tasks/MergeResources.kt#875
-      val libraryResourceDirs = variant.runtimeConfiguration
-        .artifactsFor(ArtifactType.ANDROID_RES.type)
-        .artifactFiles
-
-      val packageAwareArtifactFiles = variant.runtimeConfiguration
-        .artifactsFor(ArtifactType.SYMBOL_LIST_WITH_PACKAGE_NAME.type)
-        .artifactFiles
+      val packageAwareArtifacts = project.configurations
+        .getByName("${variant.name}RuntimeClasspath")
+        .incoming
+        .artifactView {
+          it.attributes.attribute(ARTIFACT_TYPE_ATTRIBUTE, "android-symbol-with-package-name")
+        }
+        .artifacts
 
       val writeResourcesTask = project.tasks.register(
         "preparePaparazzi${variantSlug}Resources",
@@ -109,17 +110,15 @@ class PaparazziPlugin : Plugin<Project> {
       ) { task ->
         val android = project.extensions.getByType(BaseExtension::class.java)
         val nonTransitiveRClassEnabled =
-          (project.findProperty("android.nonTransitiveRClass") as? String)?.toBoolean() ?: true
+          (project.findProperty("android.nonTransitiveRClass") as? String).toBoolean()
 
         task.packageName.set(android.packageName())
-        task.artifactFiles.from(packageAwareArtifactFiles)
+        task.artifactFiles.from(packageAwareArtifacts.artifactFiles)
         task.nonTransitiveRClassEnabled.set(nonTransitiveRClassEnabled)
         task.mergeResourcesOutputDir.set(buildDirectory.asRelativePathString(mergeResourcesOutputDir))
         task.targetSdkVersion.set(android.targetSdkVersion())
         task.compileSdkVersion.set(android.compileSdkVersion())
         task.mergeAssetsOutputDir.set(buildDirectory.asRelativePathString(mergeAssetsOutputDir))
-        task.localResourceDirs.from(localResourceDirs)
-        task.libraryResourceDirs.from(libraryResourceDirs)
         task.paparazziResources.set(buildDirectory.file("intermediates/paparazzi/${variant.name}/resources.txt"))
       }
 
@@ -165,8 +164,8 @@ class PaparazziPlugin : Plugin<Project> {
       val testTaskProvider = project.tasks.named("test$testVariantSlug", Test::class.java) { test ->
         test.systemProperties["paparazzi.test.resources"] =
           writeResourcesTask.flatMap { it.paparazziResources.asFile }.get().path
-        test.systemProperties["paparazzi.build.dir"] = buildDirectory.get().toString()
-        test.systemProperties["paparazzi.artifacts.cache.dir"] = gradleUserHomeDir.path
+        test.systemProperties["paparazzi.build.dir"] =
+          buildDirectory.get().toString()
         test.systemProperties["kotlinx.coroutines.main.delay"] = true
         test.systemProperties.putAll(project.properties.filterKeys { it.startsWith("app.cash.paparazzi") })
 
@@ -223,6 +222,9 @@ class PaparazziPlugin : Plugin<Project> {
   }
 
   private fun Project.setupNativePlatformDependency(): FileCollection {
+    val nativePlatformConfiguration = configurations.create("nativePlatform")
+    configurations.add(nativePlatformConfiguration)
+
     val operatingSystem = OperatingSystem.current()
     val nativeLibraryArtifactId = when {
       operatingSystem.isMacOsX -> {
@@ -232,8 +234,6 @@ class PaparazziPlugin : Plugin<Project> {
       operatingSystem.isWindows -> "win"
       else -> "linux"
     }
-
-    val nativePlatformConfiguration = configurations.create("nativePlatform")
     nativePlatformConfiguration.dependencies.add(
       dependencies.create("app.cash.paparazzi:layoutlib-native-$nativeLibraryArtifactId:$NATIVE_LIB_VERSION")
     )
@@ -243,7 +243,10 @@ class PaparazziPlugin : Plugin<Project> {
     }
 
     return nativePlatformConfiguration
-      .artifactViewFor(ArtifactTypeDefinition.DIRECTORY_TYPE)
+      .incoming
+      .artifactView {
+        it.attributes.attribute(ARTIFACT_TYPE_ATTRIBUTE, ArtifactTypeDefinition.DIRECTORY_TYPE)
+      }
       .files
   }
 
@@ -253,7 +256,19 @@ class PaparazziPlugin : Plugin<Project> {
     )
   }
 
-  private fun BaseExtension.packageName(): String = namespace ?: ""
+  private fun BaseExtension.packageName(): String {
+    namespace?.let { return it }
+
+    // TODO: explore whether AGP 7.x APIs can handle source set filtering
+    sourceSets
+      .filterNot { it.name.startsWith("androidTest") }
+      .map { it.manifest.srcFile }
+      .filter { it.exists() }
+      .forEach {
+        return getPackageNameFromManifest(it)
+      }
+    throw IllegalStateException("No source sets available")
+  }
 
   private fun BaseExtension.compileSdkVersion(): String {
     return compileSdkVersion!!.substringAfter("android-", DEFAULT_COMPILE_SDK_VERSION.toString())
@@ -272,4 +287,7 @@ private fun Directory.relativize(child: Directory): String {
 private fun DirectoryProperty.asRelativePathString(child: Provider<Directory>): Provider<String> =
   flatMap { root -> child.map { root.relativize(it) } }
 
+// TODO: Migrate to ArtifactTypeDefinition.ARTIFACT_TYPE_ATTRIBUTE when Gradle 7.3 is
+//  acceptable as the minimum supported version
+private val ARTIFACT_TYPE_ATTRIBUTE = Attribute.of("artifactType", String::class.java)
 private const val DEFAULT_COMPILE_SDK_VERSION = 33

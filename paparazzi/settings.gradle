@@ -1,4 +1,4 @@
-rootProject.name = 'paparazzi-libs'
+rootProject.name = 'paparazzi'
 
 include ':paparazzi'
 include ':paparazzi-agent'
